@@ -22,8 +22,10 @@ static void A0(int argc, const char* argv[]) {
 static PointLightSource light;
 static void setupLightSource() {
     //light.position = float3(0.5f, 4.0f, 1.0f); // use this for sponza.obj
+    //light.position = float3(0.0f, 0.2f, 0.1f);
     light.position = float3(3.0f, 3.0f, 3.0f);
     light.wattage = float3(1000.0f, 1000.0f, 1000.0f);
+    //light.wattage = float3(10.0f, 10.0f, 10.0f);
     globalScene.addLight(&light);
 }
 
@@ -33,7 +35,7 @@ static void setupLightSource() {
 // loading .obj file from the command line arguments
 static TriangleMesh mesh;
 static void setupScene(int argc, const char* argv[]) {
-    if (argc > 1) {
+    if (argc>20) {
         bool objLoadSucceed = mesh.load(argv[1]);
         if (!objLoadSucceed) {
             printf("Invalid .obj file.\n");
@@ -41,11 +43,32 @@ static void setupScene(int argc, const char* argv[]) {
             mesh.createSingleTriangle();
         }
     } else {
+        bool objLoadSucceed = mesh.load("E:\\Programming\\CC++\\CS488\\cs488\\media\\testObj.obj");
+        //bool objLoadSucceed = mesh.load("E:\\Programming\\CC++\\CS488\\cs488\\media\\cornellbox.obj");
+        //bool objLoadSucceed = mesh.load("D:\\Programming\\cs488\\media\\testObj.obj");
+       
+        if (!objLoadSucceed) {
+            printf("Invalid .obj file.\n");
+            printf("Making a single triangle instead.\n");
+            mesh.createSingleTriangle();
+        }
+        /*
         printf("Specify .obj file in the command line arguments. Example: CS488.exe cornellbox.obj\n");
         printf("Making a single triangle instead.\n");
         mesh.createSingleTriangle();
+        */
     }
     globalScene.addObject(&mesh);
+    globalScene.background.load("E:\\Programming\\CC++\\CS488\\cs488\\media\\uffizi_probe.hdr");
+    /*
+    for (auto t :mesh.triangles){
+        for (auto s :t.positions)
+            std::cout<<"untransformed: "<<s.x<<" "<<s.y<<" "<<s.z<<std::endl;
+        
+        std::cout<<"color: "<<t.texcoords[0].x<<" "<<t.texcoords[1].x<<" "<<t.texcoords[2].x<<std::endl;
+        std::cout<<std::endl;
+    }
+    */
 }
 static void A1(int argc, const char* argv[]) {
     setupScene(argc, argv);
@@ -70,9 +93,10 @@ static void A3(int argc, const char* argv[]) {
 
 
 int main(int argc, const char* argv[]) {
-    A0(argc, argv);
-    //A1(argc, argv);
-    //A2(argc, argv);
+    //A0(argc, argv);
+    //const char* x []= {"cornellbox.obj"};
+    //A1(argc,argv);
+    A2(argc, argv);
     //A3(argc, argv);
 
     CS488.start();

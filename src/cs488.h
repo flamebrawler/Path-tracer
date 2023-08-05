@@ -28,13 +28,14 @@ using namespace linalg::aliases;
 // animated GIF writer
 #include "gif.h"
 
-
 // misc
 #include <iostream>
 #include <vector>
 #include <cfloat>
 
+#include <queue>
 
+#include <chrono>
 // main window
 static GLFWwindow* globalGLFWindow;
 
@@ -73,7 +74,7 @@ const float globalDistanceToFilm = globalFilmSize / (2.0f * tan(globalFOV * DegT
 bool globalEnableParticles = false;
 constexpr float deltaT = 0.002f;
 constexpr float3 globalGravity = float3(0.0f, -9.8f, 0.0f);
-constexpr int globalNumParticles = 300;
+constexpr int globalNumParticles = 100;
 
 
 // dynamic camera parameters
@@ -82,7 +83,7 @@ float3 globalLookat = float3(0.0f, 0.0f, 0.0f);
 float3 globalUp = normalize(float3(0.0f, 1.0f, 0.0f));
 float3 globalViewDir; // should always be normalize(globalLookat - globalEye)
 float3 globalRight; // should always be normalize(cross(globalViewDir, globalUp));
-bool globalShowRaytraceProgress = false; // for ray tracing
+bool globalShowRaytraceProgress = true; // for ray tracing
 
 
 // mouse event
@@ -120,7 +121,13 @@ static const std::string FSDrawSource = R"(
 )";
 static const char* PFSDrawSource = FSDrawSource.c_str();
 
-
+void print(char* n,const float3 v[3]){
+	for(int i = 0;i<3;i++)
+		std::cout<<n<<i<<" "<<v[i].x<<" "<<v[i].y<<" "<<v[i].z<<std::endl;
+}
+void print(char* n,float3 v){
+	std::cout<<n<<" "<<v.x<<" "<<v.y<<" "<<v.z<<std::endl;
+}
 
 // fast random number generator based pcg32_fast
 #include <stdint.h>
@@ -400,7 +407,8 @@ public:
 enum enumMaterialType {
 	MAT_LAMBERTIAN,
 	MAT_METAL,
-	MAT_GLASS
+	MAT_GLASS,
+	MAT_LIGHT
 };
 class Material {
 public:
@@ -454,7 +462,7 @@ public:
 			// BRDF
 			brdfValue = Kd / PI;
 		} else if (type == MAT_METAL) {
-			// empty
+			brdfValue = Ks;
 		} else if (type == MAT_GLASS) {
 			// empty
 		}
@@ -466,22 +474,26 @@ public:
 		// it has to be consistent with the sampler
 		float pdfValue = 0.0f;
 		if (type == MAT_LAMBERTIAN) {
-			// empty
+			pdfValue = 1/(PI);
 		} else if (type == MAT_METAL) {
-			// empty
+			pdfValue = 1;
 		} else if (type == MAT_GLASS) {
-			// empty
+			pdfValue = 1;
 		}
 		return pdfValue;
 	}
 
-	float3 sampler(const float3& wGiven, float& pdfValue) const {
+	float3 sampler(const float3& wGiven, const float3& norm, float& pdfValue) const {
 		// sample a vector and record its probability density as pdfValue
 		float3 smp = float3(0.0f);
 		if (type == MAT_LAMBERTIAN) {
-			// empty
+			float r1=2*PI*PCG32::rand(), r2=PCG32::rand(), r2s=sqrt(r2);
+    		float3 w=norm;
+			float3 u= normalize(cross(abs(w.x)>.1?float3(0,1,0):float3(1,0,0),w));
+			float3 v=cross(w,u);
+    		smp = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrtf(1-r2));
 		} else if (type == MAT_METAL) {
-			// empty
+			smp = normalize(-wGiven-2*dot(-wGiven,norm)*norm);
 		} else if (type == MAT_GLASS) {
 			// empty
 		}
@@ -612,7 +624,8 @@ struct Triangle {
 
 
 // triangle mesh
-static float3 shade(const HitInfo& hit, const float3& viewDir, const int level = 0);
+static float3 shade(const HitInfo& hit, const float3& viewDir, const int level = 0,const float eta = 1);
+static float3 shade_pathtrace(const HitInfo& hit, const float3& viewDir, const int level=0,const float eta=1);
 class TriangleMesh {
 public:
 	std::vector<Triangle> triangles;
@@ -629,10 +642,31 @@ public:
 			for (int k = 0; k <= 2; k++) {
 				const float3 &p = this->triangles[i].positions[k];
 				const float3 &n = this->triangles[i].normals[k];
+
+				const float4 &p_4 = float4(p,1);
+				const float4 &n_4 = float4(n,1);
+
 				// not doing anything right now
 			}
 		}
 	}
+
+	float getArea(float2 a,float2 b,float2 c)const{
+		return abs(cross(c-a,b-a))/2.0f;
+	}
+	
+	float3 getBaryCoords(std::array<float3,3> &tri, float2 coord)const{
+		float3 result = {};
+		for (int corner = 0;corner<3;corner++){
+			result[corner] = getArea(tri[(corner+1)%3].xy(),tri[(corner+2)%3].xy(),coord);
+		}
+		return result;
+	}
+
+	bool belowLine(float3 point, float3 norm, float i,float j)const{
+		return dot(float2({i,j})-point.xy(),norm.xy())<0;
+	}
+
 
 	void rasterizeTriangle(const Triangle& tri, const float4x4& plm) const {
 		// ====== implement it in A1 ======
@@ -641,6 +675,102 @@ public:
 		// you do not need to implement clipping
 		// you may call the "shade" function to get the pixel value
 		// (you may ignore viewDir for now)
+
+		
+		std::array<float4,3> arr;
+		std::array<float3,3> points;
+		//std::cout<<"player pos: "<<globalEye.x<<" "<<globalEye.y<<" "<<globalEye.z<<std::endl;
+		//std::cout<<"player lookat: "<<globalViewDir.x<<" "<<globalViewDir.y<<" "<<globalViewDir.z<<std::endl;
+		for (int i = 0;i<3;i++){
+			float4 x = float4(tri.positions[i],1);
+			float4 b = float4(tri.normals[i],0);
+			arr[i] = mul(plm,x);
+			points[i] = arr[i].xyz()/arr[i].w;
+			//std::cout<<"transformed: "<<arr[i].x<<" "<<arr[i].y<<" "<<arr[i].z<<" "<<arr[i].w<<std::endl;
+			//std::cout<<"transformed/w: "<<points[i].x<<" "<<points[i].y<<" "<<points[i].z<<std::endl;
+			//std::cout<<"untransformed: "<<x.x<<" "<<x.y<<" "<<x.z<<" "<<x.w<<std::endl;
+		}
+		//std::cout<<std::endl;
+
+
+		float2 min = {(float)globalWidth,(float)globalHeight};
+		float2 max = {0,0};
+
+		//get bounds of triangle so you don't have to compute everything for all objects
+		
+		for (int i = 0;i<3;i++){
+			for (int j = 0;j<2;j++){
+				if (points[i][j]<min[j])
+					min[j] = points[i][j] - 3.0f;// for rounding errors when sampling
+				if (points[i][j]>max[j])
+					max[j] = points[i][j] + 3.0f;
+			}
+		}
+		
+		
+		//std::cout<<min.x<<" "<<min.y<<std::endl;
+		//std::cout<<max.x<<" "<<max.y<<std::endl;
+
+		std::array<float3,3> norms;
+
+		//get normals for every side for calulating boundaries
+		for (int i = 0;i<3;i++){
+			float3 p1 = points[(i)%3];
+			float3 p2 = points[(i+1)%3];
+			float3 p3 = points[(i+2)%3];
+			float3 a = p2-p1;
+			//std::cout<<"a "<<a.x<<" "<<a.y<<std::endl;
+			float3 c = p3-p1;
+			//std::cout<<"c "<<c.x<<" "<<c.y<<std::endl;
+			norms[i] = c- a*dot(a,c)/length2(a);
+			//std::cout<<"norms "<<norms[i].x<<" "<<norms[i].y<<std::endl;
+		}
+
+		//float4 &refPoint1 = arr[2];
+		//float3 normal = cross((arr[2]-arr[0]).xyz(),(arr[1]-arr[0]).xyz());
+
+		float total = getArea(points[0].xy(),points[1].xy(),points[2].xy());
+
+		float3 w = {1/arr[0].w,1/arr[1].w,1/arr[2].w};
+		float3 z = {arr[0].z,arr[1].z,arr[2].z};
+		float3 d = w*z;
+		
+		for (int j = std::max(0.0f,min.y); j < std::min(globalHeight,(int)max.y); j++) {
+			for (int i = std::max(0.0f,min.x); i < std::min(globalWidth,(int)max.x); i++) {
+				bool isInTriangle = true;
+				for (int side = 0;side<3;side++){
+					if (belowLine(points[side],norms[side],i,j)){
+						isInTriangle = false;
+					}
+				}
+					
+				if (isInTriangle){
+					float3 psi = getBaryCoords(points,{(float)i,(float)j})/total;
+
+					//float depth = refPoint1.z - dot((float2({(float)i,(float)j}) - refPoint1.xy()),normal.xy())/normal.z;
+					float depth = dot(psi,d);
+					if(depth<1 && depth < FrameBuffer.depth(i,j)){
+						HitInfo hit = {};
+						hit.material = &materials[tri.idMaterial];
+						hit.N = mul(float3x3(tri.normals[0],tri.normals[1],tri.normals[2]),psi);
+						hit.P = float3({(float)i,(float)j,depth});
+						hit.t = depth;
+						if (hit.material->isTextured){
+							const float2x3 truecorners ={tri.texcoords[0],tri.texcoords[1],tri.texcoords[2]};
+
+							float2 P = mul(truecorners,psi*w);
+							float W = dot(psi,w);
+							float2 texcoord = P/W;
+							hit.T = texcoord;
+						}
+
+						FrameBuffer.pixel(i, j) = shade(hit,{});//materials[tri.idMaterial].Kd ;
+						FrameBuffer.depth(i,j) = depth;
+					}
+				}
+
+			}
+		}
 	}
 
 
@@ -649,7 +779,37 @@ public:
 		// ray-triangle intersection
 		// fill in "result" when there is an intersection
 		// return true/false if there is an intersection or not
-		return false;
+		float3 a = tri.positions[0]- tri.positions[1];
+		float3 b = tri.positions[0]-tri.positions[2];
+		float3 c = ray.d;
+		float3 d = tri.positions[0]-ray.o;
+		
+		float D = determinant(float3x3(a,b,c));
+		float A = determinant(float3x3(d,b,c));
+		float B = determinant(float3x3(a,d,c));
+		float C = determinant(float3x3(a,b,d));
+		
+		float beta = A/D;
+		float gamma = B/D;
+		float alpha = 1-beta-gamma;
+		//std::cout<<alpha<<" "<<beta<<" "<<gamma<<std::endl;
+
+		if (alpha>1 || alpha<0 || beta<0 || gamma < 0)//outside of triangle
+			return false;
+
+		float3 phi = {alpha,beta,gamma};
+		result.t = C/D;
+		result.material = &materials[tri.idMaterial];
+		result.P = mul(float3x3(tri.positions[0],tri.positions[1],tri.positions[2]),phi);
+		result.N = mul(float3x3(tri.normals[0],tri.normals[1],tri.normals[2]),phi);
+		result.T = mul(float2x3(tri.texcoords[0],tri.texcoords[1],tri.texcoords[2]),phi);
+
+		if (dot(result.N,ray.d)>0){// if hit from the back
+			result.N = -result.N;
+		}
+		//print("P",result.P);
+		//print("tri",tri.positions);
+		return result.t>tMin && result.t<tMax && result.t>0.00001;
 	}
 
 
@@ -697,6 +857,9 @@ public:
 				if (materials[i].name.compare(0, 5, "glass", 0, 5) == 0) {
 					materials[i].type = MAT_GLASS;
 					materials[i].eta = 1.5f;
+				}
+				if (materials[i].name.compare(0, 5, "light", 0, 5) == 0) {
+					materials[i].type = MAT_LIGHT;
 				}
 			}
 		} else {
@@ -1156,11 +1319,12 @@ class BVHNode {
 public:
 	bool isLeaf;
 	int idLeft, idRight;
+	int idParent;
+	int idSibling;
 	int triListNum;
 	int* triList;
 	AABB bbox;
 };
-
 
 // ====== implement it in A2 extra ======
 // fill in the missing parts
@@ -1176,9 +1340,9 @@ public:
 	int nodeNum = 0;
 
 	BVH() {}
-	void build(const TriangleMesh* mesh);
+	virtual void build(const TriangleMesh* mesh);
 
-	bool intersect(HitInfo& result, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX) const {
+	virtual bool intersect(HitInfo& result, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX) const {
 		bool hit = false;
 		HitInfo tempMinHit;
 		result.t = FLT_MAX;
@@ -1193,7 +1357,7 @@ public:
 	}
 	bool traverse(HitInfo& result, const Ray& ray, int node_id, float tMin, float tMax) const;
 
-private:
+protected:
 	void sortAxis(int* obj_index, const char axis, const int li, const int ri) const;
 	int splitBVH(int* obj_index, const int obj_num, const AABB& bbox);
 
@@ -1235,12 +1399,23 @@ void BVH::sortAxis(int* obj_index, const char axis, const int li, const int ri) 
 }
 
 
-//#define SAHBVH // use this in once you have SAH-BVH
+static inline float SAHnosplitcost(const int obj_num){
+	const float Cb = .1f, C0 = 1;
+	return obj_num*C0;
+}
+static inline float SAHcost(const AABB& child, const AABB& parent,const int obj_num){
+	const float Cb = .1f, C0 = 1;
+	return Cb + child.area()/parent.area()*obj_num*C0;
+}
+
+#define SAHBVH // use this in once you have SAH-BVH
 int BVH::splitBVH(int* obj_index, const int obj_num, const AABB& bbox) {
 	// ====== exntend it in A2 extra ======
-#ifndef SAHBVH
+	AABB bestbboxL, bestbboxR;
+	bool nosplit = false;
 	int bestAxis, bestIndex;
-	AABB bboxL, bboxR, bestbboxL, bestbboxR;
+#ifndef SAHBVH
+	AABB bboxL, bboxR;
 	int* sorted_obj_index  = new int[obj_num];
 
 	// split along the largest axis
@@ -1273,18 +1448,77 @@ int BVH::splitBVH(int* obj_index, const int obj_num, const AABB& bbox) {
 
 	bestbboxL = bboxL;
 	bestbboxR = bboxR;
+
+	if (obj_num<=4)
+		nosplit = true;
 #else
 	// implelement SAH-BVH here
+	AABB bboxL, bboxR;
+	AABB* bboxLlist = new AABB[obj_num-1];
+	AABB* bboxRlist = new AABB[obj_num-1];
+
+	int* sorted_obj_index  = new int[obj_num];
+
+	// split along the largest axis
+	bestAxis = bbox.getLargestAxis();
+
+	// sorting along the axis
+	this->sortAxis(obj_index, bestAxis, 0, obj_num - 1);
+	for (int i = 0; i < obj_num; ++i) {
+		sorted_obj_index[i] = obj_index[i];
+	}
+
+	bboxL.reset();
+	bboxR.reset();
+	for (int i = 0; i < obj_num-1; ++i) {
+		const Triangle& tri = triangleMesh->triangles[obj_index[i]];
+		bboxL.fit(tri.positions[0]);
+		bboxL.fit(tri.positions[1]);
+		bboxL.fit(tri.positions[2]);
+		bboxLlist[i] = bboxL;
+		
+		const Triangle& tri2 = triangleMesh->triangles[obj_index[obj_num-1-i]];
+		bboxR.fit(tri2.positions[0]);
+		bboxR.fit(tri2.positions[1]);
+		bboxR.fit(tri2.positions[2]);
+		bboxRlist[i] = bboxR;
+	}
+
+	
+	float min_cost = FLT_MAX;
+
+	for (int i = 0; i < obj_num-1; ++i) {
+		AABB& bbox1 = bboxLlist[i];
+		AABB& bbox2 = bboxRlist[obj_num-2-i];//bbox2 should contain the rest of the objects
+		float cost1 = SAHcost(bbox1,bbox,i+1);
+		float cost2 = SAHcost(bbox2,bbox,obj_num-i-1);
+		float cost = cost1+cost2;
+		if (cost<min_cost){
+			bestbboxL = bboxLlist[i];
+			bestbboxR = bboxRlist[obj_num-i-2];
+			bestIndex= i;
+			min_cost = cost;
+		}
+	}
+
+	if (min_cost > SAHnosplitcost(obj_num) || obj_num <=1)
+		nosplit = true;
+
+
 #endif
 
-	if (obj_num <= 4) {
+	if (nosplit) {
 		delete[] sorted_obj_index;
 
 		this->nodeNum++;
 		this->node[this->nodeNum - 1].bbox = bbox;
 		this->node[this->nodeNum - 1].isLeaf = true;
 		this->node[this->nodeNum - 1].triListNum = obj_num;
+		#ifndef USING_GPU
 		this->node[this->nodeNum - 1].triList = new int[obj_num];
+		#else
+		this->node[this->nodeNum - 1].triList = cudaMallocManaged(sizeof(int)*obj_num);
+		#endif
 		for (int i = 0; i < obj_num; i++) {
 			this->node[this->nodeNum - 1].triList[i] = obj_index[i];
 		}
@@ -1335,7 +1569,11 @@ void BVH::build(const TriangleMesh* mesh) {
 		obj_index[i] = i;
 	}
 	this->nodeNum = 0;
+	#ifndef USING_GPU
 	this->node = new BVHNode[obj_num * 2];
+	#else
+	this->node = cudaMallocManaged(sizeof(BVHNode)*obj_num * 2);
+	#endif
 	this->leafNum = 0;
 
 	// calculate a scene bounding box
@@ -1396,6 +1634,174 @@ bool BVH::traverse(HitInfo& minHit, const Ray& ray, int node_id, float tMin, flo
 }
 
 
+struct CollNode{
+	int idHit, idMiss;
+};
+
+class StacklessBVH : public BVH{
+public:
+	CollNode* refNode = nullptr;
+	StacklessBVH() {}
+	void build(TriangleMesh* mesh){
+		BVH::build(mesh);
+		refNode = new CollNode[nodeNum];
+		
+		std::function<void(int,int)> assign_hitmiss = [&](int missidx,int idx){
+			if (node[idx].isLeaf)
+				refNode[idx].idHit = missidx;
+			else{
+				refNode[idx].idHit = node[idx].idLeft;
+				assign_hitmiss(node[idx].idRight,node[idx].idLeft);
+				assign_hitmiss(missidx,node[idx].idRight);
+			}
+			refNode[idx].idMiss = missidx;
+		};
+		assign_hitmiss(0,0);
+	}
+	bool intersect(HitInfo& minHit, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX)const{
+
+		HitInfo tempMinHit;
+		int node_idx = 0;
+		bool hit = false;
+		minHit.t =FLT_MAX;
+
+		do{	
+			if (node[node_idx].bbox.intersect(tempMinHit, ray)) {
+				if (node[node_idx].isLeaf) {
+					for (int i = 0; i< node[node_idx].triListNum;i++)
+						if (triangleMesh->raytraceTriangle(tempMinHit, ray, triangleMesh->triangles[node[node_idx].triList[i]], tMin, tMax)) {
+							hit = true;
+							if (tempMinHit.t < minHit.t) minHit = tempMinHit;
+						}
+				}
+				node_idx = refNode[node_idx].idHit;
+			} else {
+				node_idx = refNode[node_idx].idMiss;
+			}
+		}while (node_idx!=0);
+		return hit;
+	}
+	bool isHit(HitInfo& minHit, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX)const{
+
+		HitInfo tempMinHit;
+		int node_idx = 0;
+		minHit.t =FLT_MAX;
+
+		do{	
+			if (node[node_idx].bbox.intersect(tempMinHit, ray)) {
+				if (node[node_idx].isLeaf) {
+					for (int i = 0; i< node[node_idx].triListNum;i++)
+						if (triangleMesh->raytraceTriangle(tempMinHit, ray, triangleMesh->triangles[node[node_idx].triList[i]], tMin, tMax)) {
+							if (tempMinHit.t < minHit.t) minHit = tempMinHit;
+							return true;
+						}
+				}
+				node_idx = refNode[node_idx].idHit;
+			} else {
+				node_idx = refNode[node_idx].idMiss;
+			}
+		}while (node_idx!=0);
+		return false;
+	}
+};
+
+class StacklessBVH2: public BVH{
+
+public:
+	
+	StacklessBVH2() {}
+	void build(TriangleMesh* mesh){
+		BVH::build(mesh);
+
+		node[0].idSibling = 0;
+		node[0].idParent = 0;
+		std::function<void(int)> assign_extra = [&](int idx){
+			if (!node[idx].isLeaf){
+				node[node[idx].idLeft].idSibling = node[idx].idRight;
+				node[node[idx].idRight].idSibling = node[idx].idLeft;
+				node[node[idx].idLeft].idParent = idx;
+				node[node[idx].idRight].idParent = idx;
+
+				assign_extra(node[idx].idLeft);
+				assign_extra(node[idx].idRight);
+			}
+		};
+		assign_extra(0);
+	}
+
+	bool intersect(HitInfo& minHit, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX)const{
+		
+		HitInfo tempMinHit;
+		int node_idx = 0;
+		int bittrail = 0;
+		bool hit = false;
+		minHit.t =FLT_MAX;
+
+		HitInfo tempMinHitL, tempMinHitR;
+		//assume the first one hits
+
+		if(!node[node_idx].bbox.intersect(tempMinHit, ray)){
+			return false;
+		}
+		
+		while(true){
+			//descend until you can't 
+			while(!node[node_idx].isLeaf){
+				bool hit1 = node[node[node_idx].idLeft].bbox.intersect(tempMinHitL, ray);
+				bool hit2 = node[node[node_idx].idRight].bbox.intersect(tempMinHitR, ray);
+
+				hit1 = hit1 && (tempMinHitL.t < minHit.t);
+				hit2 = hit2 && (tempMinHitR.t < minHit.t);
+
+				if (hit1 || hit2)
+					bittrail<<=1;
+
+				if (hit1 && hit2){
+					bittrail^=1;
+					if (tempMinHitL.t<tempMinHitR.t)
+						node_idx = node[node_idx].idLeft;
+					else
+						node_idx = node[node_idx].idRight;
+				} else if (hit1)
+					node_idx = node[node_idx].idLeft;
+				else if (hit2)
+					node_idx = node[node_idx].idRight;
+				else
+					break;
+			}
+		
+			if (node[node_idx].isLeaf) {
+				for (int i = 0; i< node[node_idx].triListNum;i++)
+					if (triangleMesh->raytraceTriangle(tempMinHit, ray, triangleMesh->triangles[node[node_idx].triList[i]], tMin, tMax)) {
+						hit = true;
+						if (tempMinHit.t < minHit.t) minHit = tempMinHit;
+					}
+			}
+			while(true){
+				if (bittrail==0)
+					return hit;	
+
+				//go up until you find a sibling to go to
+				while((bittrail &1) ==0){
+					bittrail>>=1;
+					node_idx = node[node_idx].idParent;
+				}
+
+				if (bittrail & 0x1){//two hits from the parent
+					node_idx = node[node_idx].idSibling;
+					bittrail ^= 0x1;
+					bool newhit = node[node_idx].bbox.intersect(tempMinHit, ray);
+					if (!newhit)
+						std::cout<<"this shouldnt happen"<<std::endl;
+					if(tempMinHit.t<minHit.t)
+						break;
+				}
+			}
+
+		}
+		return hit;
+	}
+};
 
 
 
@@ -1411,12 +1817,47 @@ public:
 	float3 position = float3(0.0f);
 	float3 velocity = float3(0.0f);
 	float3 prevPosition = position;
+	float3 netForce = float3(0.0f);
+	float mass = 1;
 
 	void reset() {
 		position = float3(PCG32::rand(), PCG32::rand(), PCG32::rand()) - float(0.5f);
-		velocity = 2.0f * float3((PCG32::rand() - 0.5f), 0.0f, (PCG32::rand() - 0.5f));
+		velocity = float3(0.0f);//2.0f * float3((PCG32::rand() - 0.5f), 0.0f, (PCG32::rand() - 0.5f));
 		prevPosition = position;
 		position += velocity * deltaT;
+	}
+
+	int outsideBoundary()const{
+		int ret =0;
+		if(position.x<-.5 || position.x>.5) 
+			ret|=1;
+		if (position.y<-.5 || position.y>.5)
+			ret|=2;
+		if (position.z<-.5 || position.z>.5)
+			ret|=4;
+		return ret;
+	}
+
+	float reflectAcross(float p, float axis)const{
+		return -(p-axis) + axis;
+	}
+
+	void bounceOffBoundaries(){
+		int boundary = outsideBoundary();
+		if(!boundary)
+			return;	
+		for (int i = 0;i<3;i++){
+			if (boundary & (1<<i)){
+				prevPosition[i] = reflectAcross(prevPosition[i],position[i]);
+				float offset = position[i] - (position[i]<0?-.5:.5);
+				prevPosition[i]-=offset;
+				position[i]-=offset;
+			}
+		}
+	}
+
+	void mapToSphere(float3 c, float r){
+		position = c+ r*(position - c)/length(position-c);
 	}
 
 	void step() {
@@ -1424,9 +1865,16 @@ public:
 
 		// === fill in this part in A3 ===
 		// update the particle position and velocity here
-
+		//netForce = globalGravity;
+		float3 acceleration = netForce/mass;
+		acceleration = globalGravity;
+		position = position + (position - prevPosition) + deltaT*deltaT*acceleration;	
 		prevPosition = temp;
+
+		mapToSphere(float3(0.0f),.5);
+		//bounceOffBoundaries();
 	}
+
 };
 
 
@@ -1436,7 +1884,7 @@ public:
 	TriangleMesh particlesMesh;
 	TriangleMesh sphere;
 	const char* sphereMeshFilePath = 0;
-	float sphereSize = 0.0f;
+	float sphereSize = 0;
 	ParticleSystem() {};
 
 	void updateMesh() {
@@ -1473,6 +1921,7 @@ public:
 		for (int i = 0; i < globalNumParticles; i++) {
 			particles[i].reset();
 		}
+		//particles[0].mass = 10;
 
 		if (sphereMeshFilePath) {
 			if (sphere.load(sphereMeshFilePath)) {
@@ -1488,12 +1937,57 @@ public:
 		updateMesh();
 	}
 
+	void computeGravity(){
+		for(int i =0;i<globalNumParticles;i++){
+			particles[i].netForce = float3(0.0f);
+			for(int j =1;j<globalNumParticles;j++){
+				if (i==j)
+					continue;
+				float G = 2e-3;
+				Particle& p1 = particles[i];
+				Particle& p2 = particles[j];
+				float3 force = G*p1.mass*p2.mass*(p1.position-p2.position)/((float)std::pow(length(p1.position-p2.position),3)+0.000001f);
+				p1.netForce-= force;
+				//p2.netForce+= force;
+			}
+		}
+	}
+	void computeCollisions(){
+		if(sphereSize==0)
+			return;
+		bool hasCollisions = true;
+		int reps = 0;
+		do{
+			hasCollisions = false;
+			for (int i = 0;i<globalNumParticles;i++){
+				for (int j = i+1;j<globalNumParticles;j++){
+					Particle& p1 = particles[i];
+					Particle& p2 = particles[j];
+					float diff = length(p1.position-p2.position);
+					if(diff<sphereSize*2){
+						hasCollisions=true;
+						float overlap = (sphereSize*2-diff);
+						float3 offset = (p1.position-p2.position)/diff*overlap/2;
+						float prevDist = length(p1.position-p1.prevPosition)+length(p2.position-p2.prevPosition);
+						p1.position += offset;
+						p1.prevPosition = p1.position - offset/length(offset)*prevDist/2;
+						p2.position -= offset;
+						p2.prevPosition = p2.position + offset/length(offset)*prevDist/2;
+					}
+				}
+			}
+			reps++;
+
+		}while(hasCollisions && reps<1000);
+	}
 	void step() {
 		// add some particle-particle interaction here
 		// spherical particles can be implemented here
+		//computeGravity();
 		for (int i = 0; i < globalNumParticles; i++) {
 			particles[i].step();
 		}
+		//computeCollisions();
 		updateMesh();
 	}
 };
@@ -1511,7 +2005,17 @@ class Scene {
 public:
 	std::vector<TriangleMesh*> objects;
 	std::vector<PointLightSource*> pointLightSources;
-	std::vector<BVH> bvhs;
+	std::vector<StacklessBVH2> bvhs;
+	Image background;
+	static const int total_angles_h = 0;
+	static const int total_angles_v = 0;
+	float3 directions[total_angles_h*total_angles_v];
+
+	void computeDirections(){
+		for ( int i = 0;i<total_angles_h;i++)
+			for ( int j = 0;j<total_angles_v;j++)
+				directions[i+j*total_angles_h] = normalize(float3(sin(i/(total_angles_h)*3.14159f),j/(total_angles_v-1)/2.0f+.5f,cos(i/(total_angles_h)*3.14159f)));
+	}
 
 	void addObject(TriangleMesh* pObj) {
 		objects.push_back(pObj);
@@ -1521,13 +2025,47 @@ public:
 	}
 
 	void preCalc() {
+		
+		computeDirections();
 		bvhs.resize(objects.size());
 		for (int i = 0; i < objects.size(); i++) {
 			objects[i]->preCalc();
 			bvhs[i].build(objects[i]);
 		}
+		
 	}
 
+	float3 getBackground(float3 dir) const{
+		float r = acos(dir.z)/6.283184f;
+		float2 xy = normalize(dir.xy());
+		float2 tex = {r*xy.x+.5f,-r*xy.y+.5f};
+
+		int x = int(tex.x * background.width) % background.width;
+		int y = int(tex.y * background.height) % background.height;
+		if (x < 0) x += background.width;
+		if (y < 0) y += background.height;
+
+		int pix = (x + y * background.width);
+
+
+		float3 pixel = background.pixels[pix];
+		return pixel;
+	}
+
+	// faster intersect if you don't need to know where it hits
+	bool isHit(const HitInfo& excl, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX) const {
+		bool hit = false;
+		HitInfo tempMinHit;
+
+		for (int i = 0, i_n = (int)objects.size(); i < i_n; i++) {
+			//if (objects[i]->bruteforceIntersect(tempMinHit, ray, tMin, tMax)) { // for debugging
+			if (bvhs[i].intersect(tempMinHit, ray, tMin, tMax)) {
+				hit = true;
+				break;
+			}
+		}
+		return hit;
+	}
 	// ray-scene intersection
 	bool intersect(HitInfo& minHit, const Ray& ray, float tMin = 0.0f, float tMax = FLT_MAX) const {
 		bool hit = false;
@@ -1555,6 +2093,27 @@ public:
 		m[2] = { 0.0f, 0.0f, (zFar + zNear) / (zNear - zFar), -1.0f };
 		m[3] = { 0.0f, 0.0f, (2.0f * zFar * zNear) / (zNear - zFar), 0.0f };
 
+		return m;
+	}
+	float4x4 screenMapMatrix(const int screenWidth, const int screenHeight) const {
+		// transformation to the camera coordinate
+		const float w = (float)screenWidth;
+		const float h = (float)screenHeight;
+
+		float4x4 m;
+		m[0] = { w, 0.0f, 0.0f, 0.0f };
+		m[1] = { 0.0f, h, 0.0f, 0.0f };
+		m[2] = { 0.0f, 0.0f, 1.0f, 0.0f };
+		m[3] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+		// translation according to the camera location
+		const float4x4 t = float4x4{ 
+			{1.0f, 0.0f, 0.0f, 0.0f},
+			{0.0f, 1.0f, 0.0f, 0.0f},
+			{0.0f, 0.0f, 1.0f, 0.0f},
+			{ 1.0f, 1.0f, 0.0f, 1.0f} };
+
+		m = mul(m, t);
 		return m;
 	}
 
@@ -1587,11 +2146,35 @@ public:
 		const float4x4 pm = perspectiveMatrix(globalFOV, globalAspectRatio, globalDepthMin, globalDepthMax);
 		const float4x4 lm = lookatMatrix(globalEye, globalLookat, globalUp);
 		const float4x4 plm = mul(pm, lm);
-
+		
+		const float4x4 sm = screenMapMatrix(globalWidth,globalHeight);
+		const float4x4 fm = mul(sm,plm);
+/*
+		for (int row = 0;row<4;row++){
+			for (auto el : pm.row(row))
+				std::cout<<el<<" ";
+			std::cout<<std::endl;
+		}
+		std::cout<<std::endl;
+		for (int row = 0;row<4;row++){
+			for (auto el : lm.row(row))
+				std::cout<<el<<" ";
+			std::cout<<std::endl;
+		}
+		std::cout<<std::endl;
+		for (int row = 0;row<4;row++){
+			for (auto el : plm.row(row))
+				std::cout<<el<<" ";
+			std::cout<<std::endl;
+		}
+		std::cout<<std::endl;
+		 */
+			
 		FrameBuffer.clear();
+		FrameBuffer.pixels[0]= {1,1,1};
 		for (int n = 0, n_n = (int)objects.size(); n < n_n; n++) {
 			for (int k = 0, k_n = (int)objects[n]->triangles.size(); k < k_n; k++) {
-				objects[n]->rasterizeTriangle(objects[n]->triangles[k], plm);
+				objects[n]->rasterizeTriangle(objects[n]->triangles[k], fm);
 			}
 		}
 	}
@@ -1615,7 +2198,7 @@ public:
 
 	// ray tracing (you probably don't need to change it in A2)
 	void Raytrace() const {
-		FrameBuffer.clear();
+		//FrameBuffer.clear();
 
 		// loop over all pixels in the image
 		for (int j = 0; j < globalHeight; ++j) {
@@ -1625,9 +2208,43 @@ public:
 				if (intersect(hitInfo, ray)) {
 					FrameBuffer.pixel(i, j) = shade(hitInfo, -ray.d);
 				} else {
-					FrameBuffer.pixel(i, j) = float3(0.0f);
+					//FrameBuffer.pixel(i,j) = float3(0.0f);
+					FrameBuffer.pixel(i, j) = getBackground(-ray.d);
 				}
 			}
+
+			// show intermediate process
+			if (globalShowRaytraceProgress) {
+				constexpr int scanlineNum = 64;
+				//printf("Rendering Progress: %.3f%%\r", j / float(globalHeight - 1) * 100.0f);
+				if ((j % scanlineNum) == (scanlineNum - 1)) {
+					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, globalWidth, globalHeight, GL_RGB, GL_FLOAT, &FrameBuffer.pixels[0]);
+					glRecti(1, 1, -1, -1);
+					glfwSwapBuffers(globalGLFWindow);
+					//printf("Rendering Progress: %.3f%%\r", j / float(globalHeight - 1) * 100.0f);
+					fflush(stdout);
+				}
+			}
+		}
+	}
+	void Pathtrace() const {
+		//FrameBuffer.clear();
+		sampleCount++;
+		// loop over all pixels in the image
+		for (int j = 0; j < globalHeight; ++j) {
+			for (int i = 0; i < globalWidth; ++i) {
+				const Ray ray = eyeRay(i, j);
+				HitInfo hitInfo;
+				if (intersect(hitInfo, ray)) {
+					float3 result = shade_pathtrace(hitInfo, -ray.d);
+					AccumulationBuffer.pixel(i, j) += result;
+					FrameBuffer.pixel(i, j) = AccumulationBuffer.pixel(i,j)/sampleCount;
+				} else {
+					//FrameBuffer.pixel(i,j) = float3(0.0f);
+					FrameBuffer.pixel(i, j) = getBackground(-ray.d);
+				}
+			}
+
 
 			// show intermediate process
 			if (globalShowRaytraceProgress) {
@@ -1636,7 +2253,7 @@ public:
 					glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, globalWidth, globalHeight, GL_RGB, GL_FLOAT, &FrameBuffer.pixels[0]);
 					glRecti(1, 1, -1, -1);
 					glfwSwapBuffers(globalGLFWindow);
-					printf("Rendering Progress: %.3f%%\r", j / float(globalHeight - 1) * 100.0f);
+					//printf("Rendering Progress: %.3f%%\r", j / float(globalHeight - 1) * 100.0f);
 					fflush(stdout);
 				}
 			}
@@ -1647,11 +2264,142 @@ public:
 static Scene globalScene;
 
 
+static float3 shade_pathtrace(const HitInfo& hit, const float3& viewDir, const int level,const float eta) {
+
+	float3 currDir = viewDir;
+	float3 multTerm = float3(1);
+	float3 constTerm = float3(0.0f);
+	int currlevel = level;
+	HitInfo recHit = hit;
+	float currEta = eta;
+
+	while (true){
+		if (recHit.material->type == MAT_LAMBERTIAN) {
+			// you may want to add shadow ray tracing here in A2
+			float3 L = float3(0.0f);
+			float3 brdf, irradiance;
+
+			float3 texture = float3(1);
+			if (recHit.material->isTextured) {
+				texture *= recHit.material->fetchTexture(recHit.T);
+			}
+			// loop over all of the point light sources
+			for (int i = 0; i < globalScene.pointLightSources.size(); i++) {
+				float3 l = globalScene.pointLightSources[i]->position - recHit.P;
+
+
+				// the inverse-squared falloff
+				const float falloff = length2(l);
+				HitInfo tempHit;
+				//don't do anything if there is an object in the way
+				// normalize the light direction
+				l /= sqrtf(falloff);
+				
+
+				brdf = recHit.material->BRDF(l, currDir, recHit.N);
+				// get the irradiance
+				irradiance = float(std::max(0.0f, dot(recHit.N, l)) / (4.0 * PI * falloff)) * globalScene.pointLightSources[i]->wattage;
+				//check if light is on the side you can see and that there is nothing abstructing the light
+				if (dot(recHit.N,l)>0 && globalScene.isHit(recHit,Ray(recHit.P,normalize(l)),0,sqrtf(falloff))){
+					//irradiance= float3(0.5f)*irradiance;
+					continue;
+				}
+				//return brdf * PI; //debug output
+
+				L += irradiance * texture*brdf;
+			}
+			if (currlevel>5){
+				if(PCG32::rand()<.25f)
+					return constTerm + multTerm*L;
+			}
+			
+			float pdf;
+			float3 sample = recHit.material->sampler(currDir,recHit.N,pdf);
+			float3 sample_brdf = recHit.material->BRDF(sample,currDir,recHit.N);
+			HitInfo tempHit;
+			bool hasHit = globalScene.intersect(tempHit,Ray(recHit.P,sample),0.001);
+			if (hasHit){
+				constTerm += L*multTerm;
+				multTerm *= texture*sample_brdf/pdf;
+				currDir = sample;
+				currlevel +=1;
+				recHit = tempHit;
+
+				//shade_pathtrace(tempHit,sample,level+1,eta);
+			}else{
+				
+				//*dot(sample,viewDir)/(length(sample)*length(viewDir))/pdf;
+
+				return constTerm + multTerm*(L/*+texture*sample_brdf*/);
+			}
+			
+			//texture*sample_brdf*globalScene.getBackground(sample);
+			
+			//return L;
+		} else if (recHit.material->type == MAT_METAL) {
+		
+			float pdf;
+			float3 sample = recHit.material->sampler(currDir,recHit.N,pdf);
+			float3 sample_brdf = recHit.material->BRDF(sample,currDir,recHit.N);
+			HitInfo tempHit;
+			bool hasHit = globalScene.intersect(tempHit,Ray(recHit.P,sample),0.001);
+
+			if (hasHit){
+				multTerm*=sample_brdf;
+				currDir = sample;
+				currlevel+=1;
+				recHit = tempHit;
+				//return sample_brdf*shade_pathtrace(tempHit,sample,level+1,eta);//*dot(sample,viewDir)/(length(sample)*length(viewDir))/pdf;
+			}else
+				return constTerm + multTerm*globalScene.getBackground(sample);
+			
+		} else if (recHit.material->type == MAT_GLASS) {
+				//if (level>5)//make it only go through 2 mirrors
+				//	return float3(0,0,0);
+				float eta2 = recHit.material->eta ==currEta?1:recHit.material->eta;
+				float3 w = -currDir;
+				float3 n = recHit.N; 
+				float inside = 1-pow(currEta/eta2,2)*(1-pow(dot(w,n),2));
+				HitInfo tempHit;
+
+
+				if(inside>=0){
+					float3 refracted = -normalize(currEta/eta2*(w - dot(w,n)*n)- (sqrtf(inside))*n);
+					bool hasHit = globalScene.intersect(tempHit,Ray(recHit.P,-refracted),0.01);
+
+					if (!hasHit)
+						return constTerm + multTerm*globalScene.getBackground(-refracted);
+						//return float3(0,0,0);
+					currDir = refracted;
+					currlevel+=1;
+					recHit = tempHit;
+					currEta = eta2;
+					//return shade_pathtrace(tempHit,-refracted,level+1,eta2);
+				}else{
+					HitInfo tempHit;
+					float3 reflected = normalize(w-2*dot(w,n)*n);
+					bool hasHit = globalScene.intersect(tempHit,Ray(recHit.P,reflected));
+					if (!hasHit)
+						return constTerm + multTerm*globalScene.getBackground(reflected);
+						//return globalScene.getBackground(-reflected);
+					//return shade_pathtrace(tempHit,reflected,level+1,eta);
+					currDir = reflected;
+					currlevel+=1;
+					recHit = tempHit;
+				}
+
+		} else {
+			// something went wrong - make it apparent that it is an error
+			return float3(0, 0.0f, 0);
+		}
+		
+	}
+}
 
 
 // ====== implement it in A2 ======
 // fill in the missing parts
-static float3 shade(const HitInfo& hit, const float3& viewDir, const int level) {
+static float3 shade(const HitInfo& hit, const float3& viewDir, const int level,const float eta) {
 	if (hit.material->type == MAT_LAMBERTIAN) {
 		// you may want to add shadow ray tracing here in A2
 		float3 L = float3(0.0f);
@@ -1661,28 +2409,86 @@ static float3 shade(const HitInfo& hit, const float3& viewDir, const int level) 
 		for (int i = 0; i < globalScene.pointLightSources.size(); i++) {
 			float3 l = globalScene.pointLightSources[i]->position - hit.P;
 
+
 			// the inverse-squared falloff
 			const float falloff = length2(l);
-
+			HitInfo tempHit;
+			//don't do anything if there is an object in the way
 			// normalize the light direction
 			l /= sqrtf(falloff);
+			
 
 			// get the irradiance
 			irradiance = float(std::max(0.0f, dot(hit.N, l)) / (4.0 * PI * falloff)) * globalScene.pointLightSources[i]->wattage;
 			brdf = hit.material->BRDF(l, viewDir, hit.N);
-
+			//check if light is on the side you can see and that there is nothing abstructing the light
 			if (hit.material->isTextured) {
 				brdf *= hit.material->fetchTexture(hit.T);
 			}
-			return brdf * PI; //debug output
+			if (dot(hit.N,l)>0 && globalScene.isHit(hit,Ray(hit.P,normalize(l)),0,sqrtf(falloff))){
+				irradiance= float3(0.1f)*irradiance;
+				//continue;
+			}
+			//return brdf * PI; //debug output
 
 			L += irradiance * brdf;
 		}
+		
+		int xmax = globalScene.total_angles_h, ymax = globalScene.total_angles_v;
+		for(int i = 0;i<xmax;i++){//go through all the angles
+			for(int j = 0;j<ymax;j++){
+				float3 l = globalScene.directions[i+j*xmax];
+				if (dot(hit.N,l)>0 && globalScene.isHit(hit,Ray(hit.P,normalize(l)))){
+					continue;
+				}
+				irradiance = float(std::max(0.0f, dot(hit.N, l)) / (4.0 * PI)) * 100.0f*globalScene.getBackground(l)/xmax/ymax;
+				brdf = hit.material->BRDF(l, viewDir, hit.N);
+				if (hit.material->isTextured) {
+					brdf *= hit.material->fetchTexture(hit.T);
+				}
+				L += irradiance * brdf;
+			}
+		}
+		
 		return L;
 	} else if (hit.material->type == MAT_METAL) {
-		return float3(0.0f); // replace this
+	
+		if (level>5)//make it only go through 2 mirrors`
+			return float3(.1,.1,.1);
+		HitInfo tempHit;
+		float3 reflected = normalize(-viewDir-2*dot(-viewDir,hit.N)*hit.N);
+		bool hasHit = globalScene.intersect(tempHit,Ray(hit.P,reflected),0.001);
+		if (!hasHit)
+			return globalScene.getBackground(-reflected);
+		return hit.material->Ks*shade(tempHit,reflected,level+1,eta);
+		
 	} else if (hit.material->type == MAT_GLASS) {
-		return float3(0.0f); // replace this
+			if (level>5)//make it only go through 2 mirrors
+				return float3(0,0,0);
+		 	float eta2 = hit.material->eta ==eta?1:hit.material->eta;
+			float3 w = -viewDir;
+			float3 n = hit.N; 
+			float inside = 1-pow(eta/eta2,2)*(1-pow(dot(w,n),2));
+			HitInfo tempHit;
+
+			if(inside>=0){
+				float3 refracted = normalize(eta/eta2*(w - dot(w,n)*n)- (sqrtf(inside))*n);
+				bool hasHit = globalScene.intersect(tempHit,Ray(hit.P,refracted));
+				if (!hasHit)
+					return globalScene.getBackground(-refracted);
+				 	//return float3(0,0,0);
+				return 	shade(tempHit,-refracted,level+1,eta2);
+			}else{
+				//if (level>6)//make it only go through 2 mirrors
+			//		return float3(.1,0,.1);
+				HitInfo tempHit;
+				float3 reflected = normalize(w-2*dot(w,n)*n);
+				bool hasHit = globalScene.intersect(tempHit,Ray(hit.P,reflected));
+				if (!hasHit)
+					return globalScene.getBackground(-reflected);
+				return shade(tempHit,reflected,level+1,eta);
+			}
+
 	} else {
 		// something went wrong - make it apparent that it is an error
 		return float3(100.0f, 0.0f, 100.0f);
@@ -1794,9 +2600,11 @@ public:
 			globalScene.addObject(&globalParticleSystem.particlesMesh);
 		}
 		globalScene.preCalc();
-
+		int samples = 0;
+		long long total = 0;
 		// main loop
 		while (glfwWindowShouldClose(globalGLFWindow) == GL_FALSE) {
+			auto start = std::chrono::high_resolution_clock::now();
 			glfwPollEvents();
 			globalViewDir = normalize(globalLookat - globalEye);
 			globalRight = normalize(cross(globalViewDir, globalUp));
@@ -1804,10 +2612,11 @@ public:
 			if (globalEnableParticles) {
 				globalParticleSystem.step();
 			}
-
+			//AccumulationBuffer.clear();
 			if (globalRenderType == RENDER_RASTERIZE) {
 				globalScene.Rasterize();
 			} else if (globalRenderType == RENDER_RAYTRACE) {
+				//globalScene.Pathtrace();
 				globalScene.Raytrace();
 			} else if (globalRenderType == RENDER_IMAGE) {
 				if (process) process();
@@ -1834,6 +2643,10 @@ public:
 			glfwSwapBuffers(globalGLFWindow);
 			globalFrameCount++;
 			PCG32::rand();
+			auto end = std::chrono::high_resolution_clock::now();
+			auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+			total+=frame_duration;
+			printf("Frame duration %lld, average %lld, sample %d\n",frame_duration,(total/globalFrameCount),globalFrameCount);
 		}
 	}
 };
