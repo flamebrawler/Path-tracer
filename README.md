@@ -1,5 +1,8 @@
 # GPU Accelerated Ray-tracer/Path-tracer
 
+![Screenshot](screenshot.png)
+![Screenshot](screenshot2.png)
+
 The goal of this program is to make a very fast ray tracer and expand it to a path tracer. It accomplishes this by SAH-BVH, a more optimized traversal method, and making use of the gpu for the raw speed. Then to allow for the gpu to be used we have a stackless traversal algorithm.
 
 ## More info

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(CS488)
+project(CS488 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 
@@ -13,6 +13,8 @@ file(GLOB SRC_FILES
 add_executable(CS488
         ${SRC_FILES})
 
+#set_target_properties(CS488 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 target_include_directories(CS488 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/glfw/include)
 target_include_directories(CS488 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/glew/include)
-target_link_libraries(CS488 glfw libglew_static)
+target_link_libraries(CS488 glfw libglew_static ${CUDA_LIBRARIES})
